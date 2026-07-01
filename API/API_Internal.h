@@ -62,3 +62,4 @@ extern "C" __declspec(dllexport) uint16_t SAFAPI_PlayAnimationFromGLTF(RE::Actor
 extern "C" __declspec(dllexport) SAFAPI_Handle<SAFAPI_Array<const char*>> SAFAPI_GetSkeletonNodes(const char* a_raceEditorId);
 extern "C" __declspec(dllexport) void SAFAPI_AttachClipGenerator(RE::Actor* a_actor, SAFAPI_Array<SAFAPI_TimelineData>* a_timelines, float a_transitionTime, int a_generatorType);
 extern "C" __declspec(dllexport) void SAFAPI_AttachCustomGenerator(RE::Actor* a_actor, SAFAPI_CustomGeneratorFunction a_generatorFunc, SAFAPI_CustomGeneratorFunction a_onDestroyFunc, void* a_userData, float a_transitionTime);
+extern "C" __declspec(dllexport) bool SAFAPI_IsPlayingAnimation(RE::Actor* a_actor);

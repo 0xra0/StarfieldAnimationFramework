@@ -74,6 +74,7 @@ namespace Animation
 		void UpdateGraphs(float a_deltaSeconds);
 		void RequestGraphUpdate();
 		bool HasActiveGraphs() const;
+		bool IsActorPlaying(RE::Actor* a_actor) const;
 		void EnableAnimationVtableHooks();
 		bool ShouldDeferHookInstall() const;
 		void SetMainThreadId(std::uint32_t a_threadId);

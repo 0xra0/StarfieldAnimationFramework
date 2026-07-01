@@ -66,3 +66,9 @@ void SAFAPI_AttachCustomGenerator(RE::Actor* a_actor, SAFAPI_CustomGeneratorFunc
 
 	Animation::GraphManager::GetSingleton()->AttachGenerator(a_actor, std::move(gen), a_transitionTime);
 }
+
+extern "C" bool SAFAPI_IsPlayingAnimation(RE::Actor* a_actor)
+{
+	auto* mgr = Animation::GraphManager::GetSingleton();
+	return mgr && mgr->IsActorPlaying(a_actor);
+}

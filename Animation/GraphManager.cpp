@@ -412,6 +412,12 @@ static std::atomic<bool> g_menuHookEnabled{ true };
 			const bool enabled = ParseBool(value, false);
 			g_useNAFApplyMode.store(enabled, std::memory_order_release);
 			SAF_LOG_INFO("UseNAFApplyMode: {} (1=NAF-like: bez rest/game_base, czysta macierz z animacji jak w NAF Graph::PushAnimationOutput; GLTF musi być w Z-up)", enabled ? "true" : "false");
+		} else if (key == "DefaultSkeleton") {
+			std::string skeletonName = Trim(value);
+			if (!skeletonName.empty()) {
+				Settings::SetDefaultSkeleton(skeletonName);
+				SAF_LOG_INFO("DefaultSkeleton: {} (fallback for races without their own skeleton file)", skeletonName);
+			}
 		} else if (key == "NAFForceUnitScale") {
 			const bool enabled = ParseBool(value, true);
 			g_naFForceUnitBoneScale.store(enabled, std::memory_order_release);
@@ -919,12 +925,30 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 
 	struct ActorGraphState
 	{
+		// Pre-kompilowane flagi typu kości — unikamy per-klatkowych string porównań w UpdateGraphs.
+		enum JointFlag : uint32_t {
+			kFlagNone          = 0,
+			kFlagFace          = 1 << 0,
+			kFlagMouthRegion   = 1 << 1,
+			kFlagBelly         = 1 << 2,
+			kFlagVaginaChain   = 1 << 3,
+			kFlagHand          = 1 << 4,
+			kFlagPhysics       = 1 << 5,   // IsPhysicsJoint — dynamiczna lista z INI
+			kFlagSpineOrLeg    = 1 << 6,
+			kFlagArmOrHand     = 1 << 7,
+			kFlagUpperArmOnly  = 1 << 8,
+			kFlagTorsoRef      = 1 << 9,
+			kFlagCalfOrFoot    = 1 << 10,
+		};
 		std::shared_ptr<Animation::OzzSkeleton> skeleton;
 		std::unique_ptr<Animation::Generator> generator;
 		std::vector<RE::NiAVObject*> jointNodes;
 		// 1 if the current clip contains at least one TRS channel for this joint; 0 otherwise.
 		// Used to keep face bones stable when the animation doesn't animate them.
 		std::vector<std::uint8_t> jointHasChannel;
+		// Pre-kompilowane flagi typu kości (JointFlag bitmask) — obliczane raz przy budowie mapy,
+		// zamiast wołać IsFaceJoint/IsPhysicsJoint/etc. na każdej kości co klatkę.
+		std::vector<uint32_t> jointTypeFlags;
 		std::vector<Animation::Transform> localTransforms;
 		std::vector<Animation::Transform> restTransforms;       // OZZ bind-pose, or actor rest when UseActorRestPose
 		std::vector<Animation::Transform> actorRestTransforms;  // captured from actor when building joint map (if UseActorRestPose)
@@ -934,6 +958,8 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		RE::NiAVObject* cachedActor3DRoot = nullptr;  // when 3D is recreated (e.g. after closing console), we must rebuild
 		bool loggedFirstUpdate = false;
 		bool jointMapBuildFailed = false;
+		// Po 3 kolejnych skanach refill bez nowych kości – przestań skanować (optymalizacja wydajności).
+		int refillEmptyScanCount = 0;
 		uint32_t animFrameCount = 0;
 		// NAF-style API state
 		std::string currentAnimationPath;
@@ -954,6 +980,11 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		REX::TEnumSet<RE::Actor::BOOL_BITS, std::uint32_t> backupBoolBits{};
 		bool hadBoolFlagsBackup = false;
 		REX::TEnumSet<RE::Actor::BOOL_FLAGS, std::uint32_t> backupBoolFlags{};
+		// Backup oryginalnego kąta i pozycji aktora sprzed animacji - przywracane w DetachGenerator.
+		// Zapobiega chodzeniu do tyłu po zakończeniu animacji (AI dostaje prawidłowy kąt).
+		bool hadAngleBackup = false;
+		float backupPosX = 0.0f, backupPosY = 0.0f, backupPosZ = 0.0f;
+		float backupAngleX = 0.0f, backupAngleY = 0.0f, backupAngleZ = 0.0f;
 		std::unordered_map<std::string, float> blendGraphVariables;
 	};
 
@@ -980,8 +1011,13 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		REX::TEnumSet<RE::Actor::BOOL_BITS,  std::uint32_t> bits{};
 		REX::TEnumSet<RE::Actor::BOOL_FLAGS, std::uint32_t> flags{};
 	};
+	struct PendingAngleBackup {
+		float posX = 0, posY = 0, posZ = 0;
+		float angX = 0, angY = 0, angZ = 0;
+	};
 	static std::unordered_map<RE::TESFormID, PendingLock>       g_pendingLockPosition;
 	static std::unordered_map<RE::TESFormID, PendingFlagBackup> g_pendingFlagBackup;
+	static std::unordered_map<RE::TESFormID, PendingAngleBackup> g_pendingAngleBackup;
 
 	/// Starfield: powiadom silnik o nowej pozycji refa (jak NAF TransformsManager::RequestPositionUpdate).
 	/// Wyłączone – ID 881086/149852 z NAF powodują EXCEPTION_ACCESS_VIOLATION przy Starfield 1.15.222 (inna Address Library).
@@ -1753,6 +1789,56 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		return false;
 	}
 
+	// Pre-kompilacja flag typu kości (JointFlag bitmask) na podstawie nazw ze szkieletu.
+	// Wołana raz przy budowie mapy jointów – zamiast 10+ Is*() string porównań co klatkę.
+	static void BuildJointTypeFlags(ActorGraphState& a_state)
+	{
+		if (!a_state.skeleton) return;
+		const size_t n = a_state.skeleton->jointNames.size();
+		a_state.jointTypeFlags.resize(n, ActorGraphState::kFlagNone);
+		for (size_t i = 0; i < n; ++i) {
+			const char* name = a_state.skeleton->jointNames[i].c_str();
+			if (!name || !*name) continue;
+			uint32_t flags = ActorGraphState::kFlagNone;
+
+			// IsFaceJoint
+			if (IsFaceJoint(name)) {
+				flags |= ActorGraphState::kFlagFace;
+				if (IsMouthRegionFaceJoint(name))
+					flags |= ActorGraphState::kFlagMouthRegion;
+			}
+			// IsBellyJoint
+			if (IsBellyJoint(name))
+				flags |= ActorGraphState::kFlagBelly;
+			// IsVaginaChainJoint
+			if (IsVaginaChainJoint(name))
+				flags |= ActorGraphState::kFlagVaginaChain;
+			// IsHandJoint
+			if (IsHandJoint(name))
+				flags |= ActorGraphState::kFlagHand;
+			// IsPhysicsJoint (INI)
+			if (IsPhysicsJoint(name))
+				flags |= ActorGraphState::kFlagPhysics;
+			// IsArmOrHandJoint
+			if (IsArmOrHandJoint(name))
+				flags |= ActorGraphState::kFlagArmOrHand;
+			// IsUpperArmOnlyJoint
+			if (IsUpperArmOnlyJoint(name))
+				flags |= ActorGraphState::kFlagUpperArmOnly;
+			// IsTorsoRefJoint
+			if (IsTorsoRefJoint(name))
+				flags |= ActorGraphState::kFlagTorsoRef;
+			// IsCalfOrFootJoint
+			if (IsCalfOrFootJoint(name))
+				flags |= ActorGraphState::kFlagCalfOrFoot;
+			// IsSpineOrLegJoint
+			if (IsSpineOrLegJoint(name))
+				flags |= ActorGraphState::kFlagSpineOrLeg;
+
+			a_state.jointTypeFlags[i] = flags;
+		}
+	}
+
 	// Apply animation to a bone using delta-rotation:
 	//   delta  = inv(ozz_rest_rot) * ozz_anim_rot
 	//   result = game_base_rot * delta   (game_base captured once at joint-map build time)
@@ -2477,6 +2563,9 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 				UnpackSoaTransforms(restSoa, state.restTransforms, state.skeleton->jointNames.size());
 			}
 		}
+		// Pre-kompiluj flagi typów kości (jeśli nie zrobione przez UpdateGraphs)
+		if (state.jointTypeFlags.empty())
+			BuildJointTypeFlags(state);
 		if (!g_niTransformSearchDone.load(std::memory_order_acquire)) {
 			for (size_t si = 0; si < state.jointNodes.size(); ++si) {
 				if (state.jointNodes[si]) {
@@ -2630,8 +2719,26 @@ static RE::BSTEventSource<TEvent>* ResolveEventSourceByIdOrRva(
 		uint32_t callNum = ++hookCallCount;
 
 		// During save/load/revert do not run SAF update logic; let game finish transition safely.
-		if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
-			return g_originalGraphUpdate ? g_originalGraphUpdate(a_this, a_param2, a_param3) : 0;
+		// Auto-clear after 30s if OnPostLoadGame was never called.
+		{
+			static std::chrono::steady_clock::time_point s_startTime;
+			static bool s_started = false;
+			if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+				if (!s_started) {
+					s_startTime = std::chrono::steady_clock::now();
+					s_started = true;
+				} else if (std::chrono::steady_clock::now() - s_startTime > std::chrono::seconds(30)) {
+					SAF_LOG_WARN("[HOOK] save-load in progress for >30s, auto-clearing flag (OnPostLoadGame was likely never called)");
+					g_saveLoadInProgress.store(false, std::memory_order_release);
+					s_started = false;
+					// fall through to normal processing
+				}
+				if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+					return g_originalGraphUpdate ? g_originalGraphUpdate(a_this, a_param2, a_param3) : 0;
+				}
+			} else {
+				s_started = false;
+			}
 		}
 
 		// Skip our logic until player is in world (avoids crash when loading save - world/actor 3D not ready yet).
@@ -2783,14 +2890,10 @@ static void BSAnimationGraphUpdateHook(RE::BSAnimationGraph* a_graph, RE::BSAnim
 
 	auto* mgr = GraphManager::GetSingleton();
 	const DWORD curThread = GetCurrentThreadId();
-	// PermanentTask + AssumeMainThread mogą ustawić g_mainThreadId na zły wątek — wtedy isMainThread=false
-	// i UpdateGraphs z tego hooka nigdy nie wchodzi (task przy zainstalowanym hooku nie pompuje grafów).
-	if (g_mainThreadId != curThread) {
-		if (g_mainThreadId != 0 && (callNum <= 10 || callNum % 600 == 0)) {
-			SAF_LOG_INFO("GraphManager: main thread id rebind {} -> {} (BSAnimationGraph::Update)", g_mainThreadId, curThread);
-		}
-		g_mainThreadId = curThread;
-	} else if (g_mainThreadId == 0) {
+	// UWAGA: NIE rebinduj g_mainThreadId — ten hook może odpalać się na wątku roboczym
+	// (Havok physics), a rebind blokuje główny wątek przed wywołaniem UpdateGraphs.
+	// GraphUpdateHookImpl (główny hook) zawsze działa na main thread i ustawia g_mainThreadId.
+	if (g_mainThreadId == 0) {
 		g_mainThreadId = curThread;
 		SAF_LOG_INFO("GraphManager: main thread id set to {} (BSAnimationGraph::Update)", g_mainThreadId);
 	}
@@ -3086,18 +3189,16 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 		static std::chrono::steady_clock::time_point lastLoadCheckTime;
 		static bool loadCheckScheduled = false;
 		
-		// LoadingMenu NIE jest menu głównym — przy wczytywaniu zapisu gra często ma wasInGame=true;
-		// wtedy Reset(true) w trakcie streamowania psuje stan i kończy się CTD przy drugim loadzie.
 		if (std::strcmp(menuName, "Main Menu") == 0 || std::strcmp(menuName, "MainMenu") == 0 ||
-			std::strcmp(menuName, "MainMenuMenu") == 0) {
+			std::strcmp(menuName, "MainMenuMenu") == 0 || std::strcmp(menuName, "LoadingMenu") == 0) {
 			SAF_LOG_INFO("GraphManager: Main menu detected: '{}', wasInGame={}", menuName, wasInGame);
 			if (wasInGame) {
 				auto now = std::chrono::steady_clock::now();
 				// Resetuj tylko jeśli minęły co najmniej 2 sekundy od ostatniego resetu
 				if (now - lastResetTime > std::chrono::seconds(2)) {
-					SAF_LOG_INFO("GraphManager: Menu '{}' detected - performing SAF reset (no bone restore)", menuName);
+					SAF_LOG_INFO("GraphManager: Menu '{}' detected - performing full SAF reset", menuName);
 					auto* mgr = Animation::GraphManager::GetSingleton();
-					if (mgr) mgr->Reset(false);
+					if (mgr) mgr->Reset();
 					Animation::Face::Manager::GetSingleton()->Reset();
 					Papyrus::EventManager::GetSingleton()->Reset();
 					Papyrus::SAFScript::RebindAfterLoad();
@@ -3123,10 +3224,8 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 			wasInGame = true;
 		}
 		
-		if (std::strstr(menuName, "CharGen") || std::strstr(menuName, "Look") || std::strstr(menuName, "Face")) {
-			return result;
-		}
-		if (std::strstr(menuName, "Console")) {
+		// Blokuj UpdateGraphs tylko dla PhotoModeMenu aby uniknąć crash przy wyjściu z trybu zdjęć
+		if (menuName && std::strstr(menuName, "PhotoMode")) {
 			return result;
 		}
 	}
@@ -3255,13 +3354,42 @@ static RE::UI_MESSAGE_RESULT IMenuProcessMessageHook(RE::IMenu* a_menu, RE::UIMe
 	// deref inside BSStreaming::ResourceUploader → CTD at Starfield.exe+2A462CF.
 	// g_actorGraphs is empty after Reset(false) called on kPreLoadGame, so
 	// UpdateGraphs is safe to run as soon as the flag is cleared.
-	if (g_saveLoadInProgress.load(std::memory_order_acquire)) {
+	static bool s_wasSaveLoadInProgress = false;
+	static bool s_pendingRebindAfterLoad = false;
+	static std::chrono::steady_clock::time_point s_saveLoadStartTime;
+	const bool isNowInProgress = g_saveLoadInProgress.load(std::memory_order_acquire);
+
+	if (isNowInProgress && !s_wasSaveLoadInProgress) {
+		s_saveLoadStartTime = std::chrono::steady_clock::now();
+		s_pendingRebindAfterLoad = true;
+	}
+	s_wasSaveLoadInProgress = isNowInProgress;
+
+	if (isNowInProgress) {
 		static std::atomic<uint32_t> waitLogCount{ 0 };
 		const uint32_t c = ++waitLogCount;
 		if (c <= 5 || c % 600 == 0) {
 			SAF_LOG_INFO("[TASK] save-load in progress, deferring UpdateGraphs (tick {})", c);
 		}
+
+		auto elapsed = std::chrono::steady_clock::now() - s_saveLoadStartTime;
+		if (elapsed > std::chrono::seconds(30)) {
+			SAF_LOG_WARN("[TASK] save-load in progress for >30s, auto-clearing flag (OnPostLoadGame was likely never called)");
+			g_saveLoadInProgress.store(false, std::memory_order_release);
+			s_wasSaveLoadInProgress = false;
+			waitLogCount.store(0, std::memory_order_relaxed);
+		}
+
 		return;
+	}
+
+	// Save-load just completed (flag transitioned true -> false or was auto-cleared).
+	// Rebind Papyrus now even if VM pointer is the same — OnPostLoadGame's rebind
+	// may have fired before VM was ready, and VM pointer reuse disables auto-detect.
+	if (s_pendingRebindAfterLoad) {
+		SAF_LOG_INFO("[TASK] save-load completed, rebinding Papyrus native functions");
+		Papyrus::SAFScript::RebindAfterLoad();
+		s_pendingRebindAfterLoad = false;
 	}
 
 		const bool requested = Commands::SAFCommand::HasProcessRequest();
@@ -3814,6 +3942,32 @@ static bool InstallAnimGraphManagerCallHook()
 							a_actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
 							SAF_LOG_INFO("LoadAndStartAnimation: NPC {:X} AI+movement blocked", a_actor->GetFormID());
 						}
+
+						// Backup kąta i pozycji sprzed animacji — również z PrepareActorsForScene jeśli dostępny
+						auto itAB = g_pendingAngleBackup.find(a_actor->GetFormID());
+						if (itAB != g_pendingAngleBackup.end()) {
+							if (!it->second.hadAngleBackup) {
+								it->second.backupPosX   = itAB->second.posX;
+								it->second.backupPosY   = itAB->second.posY;
+								it->second.backupPosZ   = itAB->second.posZ;
+								it->second.backupAngleX = itAB->second.angX;
+								it->second.backupAngleY = itAB->second.angY;
+								it->second.backupAngleZ = itAB->second.angZ;
+								it->second.hadAngleBackup = true;
+							}
+							g_pendingAngleBackup.erase(itAB);
+							SAF_LOG_INFO("LoadAndStartAnimation: NPC {:X} using pre-block angle backup (angZ={:.4f})", a_actor->GetFormID(), it->second.backupAngleZ);
+						} else {
+							// Brak pending angle backup — zrób backup teraz
+							if (!it->second.hadAngleBackup) {
+								RE::NiPoint3 p = a_actor->GetPosition();
+								RE::NiPoint3 a = a_actor->GetAngle();
+								it->second.backupPosX   = p.x; it->second.backupPosY   = p.y; it->second.backupPosZ   = p.z;
+								it->second.backupAngleX = a.x; it->second.backupAngleY = a.y; it->second.backupAngleZ = a.z;
+								it->second.hadAngleBackup = true;
+								SAF_LOG_INFO("LoadAndStartAnimation: NPC {:X} angle backup saved now (angZ={:.4f})", a_actor->GetFormID(), a.z);
+							}
+						}
 					}
 				}
 			}
@@ -3874,10 +4028,25 @@ static bool InstallAnimGraphManagerCallHook()
 			SAF_LOG_INFO("DetachGenerator: boolFlags restored for actor {:X}", id);
 		}
 
+		// Przywróć oryginalny kąt i pozycję aktora sprzed animacji.
+		// Zapobiega to „chodzeniu do tyłu" po zakończeniu sceny (AI dostaje prawidłowy kąt,
+		// a nie kąt sceny który był wymuszany podczas animacji).
+		if (state.hadAngleBackup) {
+			a_actor->data.angle.x = state.backupAngleX;
+			a_actor->data.angle.y = state.backupAngleY;
+			a_actor->data.angle.z = state.backupAngleZ;
+			a_actor->data.location.x = state.backupPosX;
+			a_actor->data.location.y = state.backupPosY;
+			a_actor->data.location.z = state.backupPosZ;
+			state.hadAngleBackup = false;
+			SAF_LOG_INFO("DetachGenerator: angle restored for actor {:X} (angZ={:.4f})", id, state.backupAngleZ);
+		}
+
 		g_actorGraphs.erase(it);
 		g_actorSequenceState.erase(id);
 		g_syncOwner.erase(id);
 		g_syncOwnerRootCache.erase(id);
+		g_pendingLockPosition.erase(id);
 		SAF_LOG_INFO("DetachGenerator: graph removed for actor {:X}", id);
 	}
 
@@ -3893,6 +4062,13 @@ static bool InstallAnimGraphManagerCallHook()
 		DetachGenerator(a_actor, 0.0f);
 		// UpdateWorldData so the renderer picks up the restored rotations immediately
 		SafeUpdateWorldData(a_actor, nullptr, nullptr);
+		// Odśwież kapsułę Havok po przywróceniu data.angle przez DetachGenerator.
+		// Bez tego kapsuła zachowuje rotację z animacji, a AI używa przywróconego kąta
+		// z data.angle – efekt: aktor chodzi do tyłu (kapsuła w jedną stronę, AI w drugą).
+		{
+			const RE::NiPoint3 curPos = a_actor->GetPosition();
+			a_actor->SetPosition(curPos, false);
+		}
 		SAF_LOG_INFO("[STOP] StopAnimation: done");
 	}
 
@@ -4017,7 +4193,16 @@ static bool InstallAnimGraphManagerCallHook()
 		if (it != g_actorGraphs.end()) {
 			auto& state = it->second;
 			state.positionX = a_x; state.positionY = a_y; state.positionZ = a_z;
-			const RE::NiPoint3 ang = a_actor->GetAngle();
+			RE::NiPoint3 ang = a_actor->GetAngle();
+			// Jeśli PrepareActorsForScene ustawił pendingAngleZ, użyj go zamiast GetAngle().z.
+			// Gwarantuje to że state.angleZ = kąt aktora1 (sceny) a nie własny kąt NPC.
+			{
+				auto itAng = g_pendingAngleZ.find(id);
+				if (itAng != g_pendingAngleZ.end()) {
+					ang.z = itAng->second;
+					SAF_LOG_INFO("LockActorForAnimation: using pendingAngleZ={:.4f} for actor {:X}", ang.z, id);
+				}
+			}
 			state.angleX = ang.x; state.angleY = ang.y; state.angleZ = ang.z;
 			state.positionLocked = true;
 
@@ -4029,6 +4214,16 @@ static bool InstallAnimGraphManagerCallHook()
 			if (!state.hadBoolFlagsBackup) {
 				state.backupBoolFlags = a_actor->boolFlags;
 				state.hadBoolFlagsBackup = true;
+			}
+
+			// Backup oryginalnego kąta i pozycji — przywrócone w DetachGenerator/UnlockActorAfterAnimation.
+			if (!state.hadAngleBackup) {
+				RE::NiPoint3 pos = a_actor->GetPosition();
+				state.backupPosX = pos.x; state.backupPosY = pos.y; state.backupPosZ = pos.z;
+				state.backupAngleX = state.angleX;
+				state.backupAngleY = state.angleY;
+				state.backupAngleZ = state.angleZ;
+				state.hadAngleBackup = true;
 			}
 
 			// Zablokuj heading i ruch: Actor::BOOL_BITS::kHeadingFixed, BOOL_FLAGS::kMovementBlocked.
@@ -4059,6 +4254,17 @@ static bool InstallAnimGraphManagerCallHook()
 			if (state.hadBoolFlagsBackup) {
 				a_actor->boolFlags = state.backupBoolFlags;
 				state.hadBoolFlagsBackup = false;
+			}
+			// Przywróć oryginalny kąt i pozycję (jeśli DetachGenerator jeszcze tego nie zrobił).
+			if (state.hadAngleBackup) {
+				a_actor->data.angle.x = state.backupAngleX;
+				a_actor->data.angle.y = state.backupAngleY;
+				a_actor->data.angle.z = state.backupAngleZ;
+				a_actor->data.location.x = state.backupPosX;
+				a_actor->data.location.y = state.backupPosY;
+				a_actor->data.location.z = state.backupPosZ;
+				state.hadAngleBackup = false;
+				SAF_LOG_INFO("UnlockActorAfterAnimation: angle restored for actor {:X} (angZ={:.4f})", id, state.backupAngleZ);
 			}
 		}
 	}
@@ -4187,7 +4393,7 @@ static bool InstallAnimGraphManagerCallHook()
 		using BB = RE::Actor::BOOL_BITS;
 		using BF = RE::Actor::BOOL_FLAGS;
 
-		// Krok 1+2: zapisz backup i zablokuj każdego NPC.
+		// Krok 1+2: zapisz backup (flagi + kąt) i zablokuj każdego NPC.
 		for (RE::Actor* actor : { a_actor1, a_actor2 }) {
 			if (!actor || actor->GetFormID() == 0x14) continue;
 			{
@@ -4196,11 +4402,18 @@ static bool InstallAnimGraphManagerCallHook()
 				fb.bits  = actor->boolBits;
 				fb.flags = actor->boolFlags;
 				g_pendingFlagBackup[actor->GetFormID()] = fb;
+				// Backup oryginalnego kąta i pozycji sprzed blokady — DetachGenerator przywróci.
+				PendingAngleBackup ab;
+				RE::NiPoint3 p = actor->GetPosition();
+				RE::NiPoint3 a = actor->GetAngle();
+				ab.posX = p.x; ab.posY = p.y; ab.posZ = p.z;
+				ab.angX = a.x; ab.angY = a.y; ab.angZ = a.z;
+				g_pendingAngleBackup[actor->GetFormID()] = ab;
 			}
 			actor->boolBits.set(BB::kHeadingFixed);
 			actor->boolFlags.set(BF::kMovementBlocked);
 			actor->boolFlags.reset(BF::kSceneHeadtrackRotation);
-			SAF_LOG_INFO("PrepareActorsForScene: NPC {:X} AI+movement blocked, backup saved", actor->GetFormID());
+			SAF_LOG_INFO("PrepareActorsForScene: NPC {:X} AI+movement blocked, backup saved (pos+angle)", actor->GetFormID());
 		}
 
 		// Krok 3: ustaw pozycję i kąt – AI jest już zablokowane, nie nadpisze danych.
@@ -4490,6 +4703,11 @@ static bool InstallAnimGraphManagerCallHook()
 		state.positionLocked = lockPosition;
 		state.positionX = posX; state.positionY = posY; state.positionZ = posZ;
 		state.angleX = angX; state.angleY = angY; state.angleZ = angZ;
+		// Backup oryginalnej pozycji i kąta przed animacją — przywracane w DetachGenerator.
+		// Zapobiega chodzeniu do tyłu po zakończeniu animacji (AI dostaje prawidłowy kąt).
+		state.backupPosX = posX; state.backupPosY = posY; state.backupPosZ = posZ;
+		state.backupAngleX = angX; state.backupAngleY = angY; state.backupAngleZ = angZ;
+		state.hadAngleBackup = true;
 		state.blendGraphVariables = std::move(preservedVars);
 
 		if (auto* cg = dynamic_cast<Animation::ClipGenerator*>(state.generator.get()))
@@ -4625,8 +4843,21 @@ bool GraphManager::ShouldDeferHookInstall() const
 		return g_mainThreadId != 0 && curThread == g_mainThreadId;
 	}
 
+	// Thread-local cache dla wektorów używanych per-frame w UpdateGraphs.
+	// Unika alokacji/dealokacji pamięci na każdej klatce dla każdego aktora.
+	struct UpdateGraphsCache {
+		std::vector<RE::NiAVObject*> modifiedBones;
+		std::vector<std::pair<RE::TESFormID, ActorGraphState*>> updateOrder;
+		void Clear() {
+			modifiedBones.clear();
+			updateOrder.clear();
+		}
+	};
+	static thread_local UpdateGraphsCache s_tlCache;
+
 	void GraphManager::UpdateGraphs(float a_deltaSeconds)
 	{
+		s_tlCache.Clear();
 		const DWORD curThread = GetCurrentThreadId();
 		if (g_mainThreadId == 0 && curThread != 0) {
 			g_mainThreadId = curThread;
@@ -4657,14 +4888,15 @@ bool GraphManager::ShouldDeferHookInstall() const
 
 		// Dla SAF używamy własnego delta (steady_clock), żeby prędkość odtwarzania była stosowana do rzeczywistego czasu.
 		// dt z gry (ReadAnimUpdateData) może być w złej jednostce/offsetcie i wtedy speed nic nie zmienia.
-		// (Wariant z wczesnym return przy „podwójnym” wywołaniu i twarde limicie 0.25 s powodował nieregularne kroki i pierwszą klatkę przy max dt.)
+		// (Wariant z wczesnym return przy „podwójnym" wywołaniu i twarde limicie 0.25 s powodował nieregularne kroki i pierwszą klatkę przy max dt.)
 		static std::chrono::steady_clock::time_point s_lastTick;
 		const auto now = std::chrono::steady_clock::now();
 		float dtToUse = std::chrono::duration<float>(now - s_lastTick).count();
-		if (dtToUse <= 0.0f || !std::isfinite(dtToUse) || dtToUse > 1.0f)
+		if (dtToUse <= 0.0f || !std::isfinite(dtToUse) || dtToUse > 0.25f)
 			dtToUse = a_deltaSeconds > 0.0f && std::isfinite(a_deltaSeconds) ? a_deltaSeconds : 0.016f;
 
 		std::vector<RE::Actor*> sequenceAdvanceActors;
+		std::vector<RE::Actor*> finishedAnimActors;
 		{
 			std::lock_guard<std::mutex> lock(g_graphMutex);
 			if (g_actorGraphs.empty()) {
@@ -4678,12 +4910,14 @@ bool GraphManager::ShouldDeferHookInstall() const
 			s_lastTick = now;  // tick tylko gdy faktycznie aktualizujemy grafy
 			static std::atomic<uint32_t> updateCount{ 0 };
 			const uint32_t ucount = ++updateCount;
-			// At most one BuildJointMap per frame to avoid 5–6 second freezes when several actors need setup
+			// Build joint maps for ALL actors in a scene at once (limit raised from 1).
+			// Old limit of 1 caused multi-actor scenes where actors 2+ would stand still
+			// for several frames while only actor 1 was animated.
 			int jointMapsBuiltThisFrame = 0;
-			constexpr int kMaxJointMapBuildsPerFrame = 1;
+			constexpr int kMaxJointMapBuildsPerFrame = 32;
 
 			// Kolejność jak w NAF: najpierw ownerzy (i aktorzy bez sync), potem slave’y – żeby cache root był wypełniony zanim slave go użyje.
-			std::vector<std::pair<RE::TESFormID, ActorGraphState*>> updateOrder;
+			auto& updateOrder = s_tlCache.updateOrder;
 			updateOrder.reserve(g_actorGraphs.size());
 			for (auto& kv : g_actorGraphs)
 				updateOrder.push_back({ kv.first, &kv.second });
@@ -4710,7 +4944,16 @@ bool GraphManager::ShouldDeferHookInstall() const
 				SAF_LOG_INFO("[UPDATE] UpdateGraphs: first update for actor={}, joints={}", id, state.skeleton->jointNames.size());
 			}
 
-			if (!state.jointMapBuilt && !state.jointMapBuildFailed) {
+			if (!state.jointMapBuilt) {
+				// Retry: jeśli wcześniej się nie udało, spróbuj ponownie po 30 klatkach
+				// (aktor mógł nie mieć jeszcze załadowanego 3D).
+				if (state.jointMapBuildFailed) {
+					if (state.animFrameCount < 30 || state.animFrameCount % 120 != 0) {
+						continue;
+					}
+					state.jointMapBuildFailed = false;
+					SAF_LOG_INFO("[UPDATE] UpdateGraphs: retrying joint map build for actor={} (frame={})", id, ucount);
+				}
 				if (jointMapsBuiltThisFrame >= kMaxJointMapBuildsPerFrame) {
 					continue;  // defer to next frame so we don't freeze for seconds
 				}
@@ -4724,7 +4967,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 						SAF_LOG_WARN("[UPDATE] UpdateGraphs: actor not found for id={}, will retry", id);
 					}
 				} else {
-					SAF_LOG_INFO("[UPDATE] UpdateGraphs: building joint map for actor={} (1 per frame limit)", id);
+					SAF_LOG_INFO("[UPDATE] UpdateGraphs: building joint map for actor={}", id);
 					const bool ok = SafeBuildJointMap(actor, *state.skeleton, state.jointNodes);
 					jointMapsBuiltThisFrame++;
 					if (!ok) {
@@ -4745,6 +4988,10 @@ bool GraphManager::ShouldDeferHookInstall() const
 							state.jointMapBuilt = true;
 							state.cachedActor3DRoot = GetActor3DRootRaw(actor);
 							SAF_LOG_INFO("[UPDATE] UpdateGraphs: joint map built (found {}/{})", found, state.jointNodes.size());
+
+							// Pre-kompiluj flagi typów kości (zamiast per-klatkowych Is*() string porównań)
+							BuildJointTypeFlags(state);
+							SAF_LOG_INFO("[UPDATE] UpdateGraphs: joint type flags precomputed ({} joints)", state.jointTypeFlags.size());
 
 							// ── Capture rest pose: use animation bind (t=0) when available, else skeleton rest ──
 							if (state.skeleton && state.skeleton->data) {
@@ -4896,10 +5143,14 @@ bool GraphManager::ShouldDeferHookInstall() const
 			++state.animFrameCount;
 
 			if (clipGen && clipGen->IsFinished()) {
-				state.positionLocked = false;
 				auto itSeq = g_actorSequenceState.find(id);
 				if (itSeq != g_actorSequenceState.end()) {
 					if (actor) sequenceAdvanceActors.push_back(actor);
+				} else {
+					state.positionLocked = false;
+					// Auto-stop: usuń aktora z grafu po zakończeniu animacji
+					// (bez sekwencji nie ma kto wywołać DetachGenerator).
+					if (actor) finishedAnimActors.push_back(actor);
 				}
 			}
 
@@ -4912,15 +5163,17 @@ bool GraphManager::ShouldDeferHookInstall() const
 			static Animation::Transform kIdentRest;  // default ctor: rot=(0,0,0,1)
 
 			size_t appliedCount = 0, skippedRoot = 0, skippedControlled = 0;
-			std::vector<RE::NiAVObject*> modifiedBones;
+			auto& modifiedBones = s_tlCache.modifiedBones;
 			modifiedBones.reserve(state.jointNodes.size());
 
 			// ── Partial joint map refill ──────────────────────────────────────────────────
 			// Kości fizyczne (SOS/CBBE physics) mogą być załadowane przez silnik PO tym jak
-			// SAF zbudował joint map. Co 30 klatek sprawdzamy nullptr wpisy i uzupełniamy je
+			// SAF zbudował joint map. Co 120 klatek sprawdzamy nullptr wpisy i uzupełniamy je
 			// przez GetObjectByName – bez pełnego rebuildu (bez utraty gameBaseRotations).
 			// Gdy nowe kości zostaną znalezione, przechwytujemy ich gameBase w tym miejscu.
-			if (actor && actorRoot && state.animFrameCount > 0 && state.animFrameCount % 30 == 0) {
+			// Optymalizacja: po 3 skanach bez nowych kości przestajemy skanować.
+			if (actor && actorRoot && state.animFrameCount > 0 && state.animFrameCount % 120 == 0
+				&& state.refillEmptyScanCount < 3) {
 				const std::uintptr_t refillOff = g_niTransformOffset.load(std::memory_order_acquire);
 				size_t newlyFound = 0;
 				for (size_t si = 1; si < state.jointNodes.size(); ++si) {
@@ -4945,8 +5198,11 @@ bool GraphManager::ShouldDeferHookInstall() const
 					}
 				}
 				if (newlyFound > 0) {
+					state.refillEmptyScanCount = 0;
 					SAF_LOG_INFO("[UPDATE] Partial joint refill: found {} new bones (physics/SOS loaded late) for actor {:X}",
 						newlyFound, id);
+				} else {
+					++state.refillEmptyScanCount;
 				}
 			}
 			// ────────────────────────────────────────────────────────────────────────────────
@@ -4983,53 +5239,42 @@ bool GraphManager::ShouldDeferHookInstall() const
 						continue;
 					}
 				}
+				// Używamy pre-kompilowanych flag bitowych (BuildJointTypeFlags) zamiast
+				// per-klatkowych IsFaceJoint/IsHandJoint/IsPhysicsJoint/etc. – 10+ string porównań.
+				const uint32_t jflags = (i < state.jointTypeFlags.size()) ? state.jointTypeFlags[i] : ActorGraphState::kFlagNone;
 				// Kości twarzy (Eye/Jaw/faceBone_*) – domyślnie zostawiamy silnikowi gry,
-				// z WYJĄTKIEM zestawu faceBone wokół ust (IsMouthRegionFaceJoint) — SAF może je animować.
-				const bool isFace = jointName && IsFaceJoint(jointName);
-				const bool isMouthRegionFace = jointName && IsMouthRegionFaceJoint(jointName);
-				if (isFace && !isMouthRegionFace) {
+				// z WYJĄTKIEM zestawu faceBone wokół ust (kFlagMouthRegion) — SAF może je animować.
+				if ((jflags & ActorGraphState::kFlagFace) && !(jflags & ActorGraphState::kFlagMouthRegion)) {
 					++skippedControlled;
 					continue;
 				}
 				// Kości brzucha - zostaw pod kontrolą silnika gry
-				// aby uniknąć nieprawidłowego pozycjonowania
-				const bool isBelly = jointName && IsBellyJoint(jointName);
-				if (isBelly) {
+				if (jflags & ActorGraphState::kFlagBelly) {
 					++skippedControlled;
 					continue;
 				}
 				// Wagina/labia/łechtaczka całkowicie pod kontrolą gry (bez implementacji w SAF).
-				if (jointName && IsVaginaChainJoint(jointName)) {
+				if (jflags & ActorGraphState::kFlagVaginaChain) {
 					++skippedControlled;
 					continue;
 				}
 				// Usta / okolica ust: jeśli klip nie ma kanału dla tej kości, nie animuj – zostaw grze (unikamy czarnego kwadratu).
-				if (isMouthRegionFace && i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
+				if ((jflags & ActorGraphState::kFlagMouthRegion) && i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
 					++skippedControlled;
 					continue;
 				}
 				// Dłonie: jeśli klip nie animuje tej kości (brak kanału), nie nadpisuj – zostaw grze (naturalna poza/IK).
-				if (jointName && IsHandJoint(jointName)) {
-					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
-						++skippedControlled;
-						continue;
-					}
-				}
-				// Kości fizyczne (INI), bez łańcucha waginy: bez kanału w klipie nie ruszaj — SOS/Havok.
-				if (jointName && IsPhysicsJointForSafApply(jointName)) {
-					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
-						++skippedControlled;
-						continue;
-					}
-				}
-				// TEMP: Wyłączono logikę kości piersi/włosów i fizyki do testów
-				/*
-				// Kości piersi i włosów: zostaw pod kontrolą gry aby uniknąć zniekształceń na meblach
-				if (jointName && IsBreastOrHairJoint(jointName)) {
+				if ((jflags & ActorGraphState::kFlagHand) && i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
 					++skippedControlled;
 					continue;
 				}
-				*/
+				// Kości fizyczne (INI), bez łańcucha waginy: bez kanału w klipie nie ruszaj — SOS/Havok.
+				if ((jflags & ActorGraphState::kFlagPhysics) && !(jflags & ActorGraphState::kFlagVaginaChain)) {
+					if (i < state.jointHasChannel.size() && state.jointHasChannel[i] == 0) {
+						++skippedControlled;
+						continue;
+					}
+				}
 				// HumanRace.json ma zduplikowane nazwy (L_Wrist/R_Wrist dwa razy) – oba mapują na ten sam węzeł. Zapis tylko raz (pierwszy indeks wygrywa).
 				{
 					bool alreadyApplied = false;
@@ -5136,24 +5381,30 @@ bool GraphManager::ShouldDeferHookInstall() const
 					}
 				}
 				// Wymuś orientację aktora co klatkę po zastosowaniu kości.
-				// Dla sync slave'a: najpierw synchronizuj state.angleZ ze stanem ownera,
-				// żeby yawMat slave'a był identyczny z yawMat ownera.
-				// Dla ownera i niezsyncrowanych: użyj własnego state.angleZ.
-				if (actor && actorRoot) {
-					const std::uintptr_t rotOff2 = g_niTransformOffset.load(std::memory_order_acquire);
-					if (rotOff2 != 0) {
-						float yaw = state.angleZ;
-						// Sync slave: pobierz angleZ z grafu ownera (ten sam kąt gwarantuje
-						// identyczny yawMat dla obu aktorów niezależnie od stanu NPC AI).
-						const auto itSyncChk = g_syncOwner.find(id);
-						if (itSyncChk != g_syncOwner.end() && itSyncChk->second != id) {
-							const auto itOwnerState = g_actorGraphs.find(itSyncChk->second);
-							if (itOwnerState != g_actorGraphs.end())
-								yaw = itOwnerState->second.angleZ;
+				// Yaw enforcement działa TYLKO dla:
+				//   - positionLocked (kotwienie pozycji – aktor ma zablokowany kąt)
+				//   - sync slave (synchronizacja z ownerem – slave kopiuje kąt ownera)
+				// Dla niezablokowanych, niesynchronizowanych aktorów wymuszanie yaw
+				// walczy z silnikiem gry (który ustawia data.angle według AI), powodując
+				// trzęsienie („shaking") i chodzenie do tyłu.
+				if (actor && actorRoot && !clipFinished && state.generator) {
+					const bool isSyncSlave = [&]() -> bool {
+						auto it = g_syncOwner.find(id);
+						return it != g_syncOwner.end() && it->second != id;
+					}();
+					if (state.positionLocked || isSyncSlave) {
+						const std::uintptr_t rotOff2 = g_niTransformOffset.load(std::memory_order_acquire);
+						if (rotOff2 != 0) {
+							float yaw = state.angleZ;
+							if (isSyncSlave) {
+								const auto itOwnerState = g_actorGraphs.find(g_syncOwner[id]);
+								if (itOwnerState != g_actorGraphs.end())
+									yaw = itOwnerState->second.angleZ;
+							}
+							const float c = std::cos(yaw), s = std::sin(yaw);
+							const float yawMat[9] = { c,-s,0.f, s,c,0.f, 0.f,0.f,1.f };
+							RestoreBoneRotationRaw(actorRoot, rotOff2, yawMat);
 						}
-						const float c = std::cos(yaw), s = std::sin(yaw);
-						const float yawMat[9] = { c,-s,0.f, s,c,0.f, 0.f,0.f,1.f };
-						RestoreBoneRotationRaw(actorRoot, rotOff2, yawMat);
 					}
 				}
 				SafeUpdateWorldData(actor, actorRoot, &modifiedBones);
@@ -5177,12 +5428,23 @@ bool GraphManager::ShouldDeferHookInstall() const
 			}
 		}
 		for (RE::Actor* a : sequenceAdvanceActors) AdvanceSequence(a, false);
+		// Auto-stop: aktorzy z zakończoną animacją (bez sekwencji) są usuwani z grafu.
+		for (RE::Actor* a : finishedAnimActors) {
+			StopAnimation(a);
+		}
 	}
 
 	bool GraphManager::HasActiveGraphs() const
 	{
 		std::lock_guard<std::mutex> lock(g_graphMutex);
 		return !g_actorGraphs.empty();
+	}
+
+	bool GraphManager::IsActorPlaying(RE::Actor* a_actor) const
+	{
+		if (!a_actor) return false;
+		std::lock_guard<std::mutex> lock(g_graphMutex);
+		return g_actorGraphs.find(a_actor->GetFormID()) != g_actorGraphs.end();
 	}
 
 	void GraphManager::Reset(bool a_restoreBones)
@@ -5219,6 +5481,7 @@ bool GraphManager::ShouldDeferHookInstall() const
 			g_pendingAngleZ.clear();
 			g_pendingLockPosition.clear();
 			g_pendingFlagBackup.clear();
+			g_pendingAngleBackup.clear();
 			g_loggedAvActorsBuildJointMap.clear();
 		}
 
