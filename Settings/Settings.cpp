@@ -19,6 +19,8 @@ namespace Settings
 	static bool g_allowAnimationsOnExtendedSkeleton = true;
 	/// True only after player is in world (set from GraphUpdateHook). When false, we never load extended/SFF skeleton to avoid load crash.
 	static bool g_safeToUseExtendedSkeleton = false;
+	/// Default skeleton to use as fallback for races without their own skeleton file.
+	static std::string g_defaultSkeleton = "HumanRace";
 
 	void SetSkipSkeletonPathSubstrings(std::vector<std::string> a_substrings)
 	{
@@ -33,6 +35,16 @@ namespace Settings
 	void SetSafeToUseExtendedSkeleton(bool a_safe)
 	{
 		g_safeToUseExtendedSkeleton = a_safe;
+	}
+
+	void SetDefaultSkeleton(std::string a_defaultSkeleton)
+	{
+		g_defaultSkeleton = std::move(a_defaultSkeleton);
+	}
+
+	const std::string& GetDefaultSkeleton()
+	{
+		return g_defaultSkeleton;
 	}
 
 	static SkeletonMap& GetSkeletonMapImpl()
@@ -191,12 +203,25 @@ namespace Settings
 			if (auto it = map.find(raceId); it != map.end() && it->second) {
 				return MakeSharedView(it->second.get());
 			}
+			// Fallback: jeśli szkielet dla tej rasy nie istnieje, spróbuj użyć domyślnego szkieletu
+			SAF_LOG_INFO("GetSkeleton: no skeleton for race '{}', trying default skeleton '{}'", raceId, g_defaultSkeleton);
+			if (auto it = map.find(g_defaultSkeleton); it != map.end() && it->second) {
+				SAF_LOG_INFO("GetSkeleton: using default skeleton '{}' for race '{}'", g_defaultSkeleton, raceId);
+				return MakeSharedView(it->second.get());
+			}
 		} else {
-			SAF_LOG_WARN("GetSkeleton: actor has no NPC or race (raceId null), using first skeleton in map");
+			SAF_LOG_WARN("GetSkeleton: actor has no NPC or race (raceId null), using default skeleton");
 		}
 
+		// Ostateczny fallback: użyj domyślnego szkieletu lub pierwszego w mapie
 		if (map.empty()) return nullptr;
-		auto it = map.begin();
+		auto it = map.find(g_defaultSkeleton);
+		if (it != map.end() && it->second) {
+			SAF_LOG_INFO("GetSkeleton: using default skeleton '{}' as final fallback", g_defaultSkeleton);
+			return MakeSharedView(it->second.get());
+		}
+		it = map.begin();
+		SAF_LOG_WARN("GetSkeleton: default skeleton '{}' not found, using first skeleton in map", g_defaultSkeleton);
 		return it != map.end() && it->second ? MakeSharedView(it->second.get()) : nullptr;
 	}
 

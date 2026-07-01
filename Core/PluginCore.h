@@ -83,13 +83,9 @@ namespace SAF::Core
         {
             spdlog::info("OnPostLoadGame - save loaded");
 
-            // Wyczyść flagę save-load natychmiast.
-            // g_actorGraphs jest puste po Reset(false) z kPreLoadGame (lub przy pierwszym uruchomieniu).
-            // UpdateGraphs z pustym g_actorGraphs natychmiast wraca – bezpieczne nawet gdy świat 3D
-            // jeszcze nie jest gotowy. NIE wołamy vtable[0xAC] (Get3D) podczas streamowania tekstur –
-            // to powodowało CTD w BSStreaming::ResourceUploader (Starfield.exe+2A462CF).
-            Animation::GraphManager::GetSingleton()->SetSaveLoadInProgress(false);
-            spdlog::info("OnPostLoadGame - save-load flag cleared");
+            // Nie czyść flagi save-load tutaj. Świat 3D bywa jeszcze niegotowy
+            // i wejście w UpdateGraphs może kończyć się CTD.
+            spdlog::info("OnPostLoadGame - save-load flag will be cleared when player 3D is ready");
 
             if (!hooksInstalled_) {
                 spdlog::info("Installing animation hooks (PostLoadGame)...");

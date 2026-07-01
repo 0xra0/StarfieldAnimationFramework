@@ -25,9 +25,11 @@ namespace RE
 
 		static void RegisterSink(BSTEventSink<InitLoadEvent>* a_sink) {
 			using func_t = decltype(&RegisterSink);
-			// Nowy RVA z IDA dla wersji 1.16.236: 0x2B6B490
-			// Stary ID 37725 nie istnieje w nowej wersji Address Library
-			REL::Relocation<func_t> func(REL::Offset(0x2B6B490));
+		// Address Library ID dla InitLoadEvent::RegisterSink.
+		// Zweryfikowane na bazie offsetów:
+		// - 1.16.242: VA 0x142B6B7A0 => ID 145931
+		// - 1.16.244: ID 145931 => VA 0x142B671C0
+		REL::Relocation<func_t> func(REL::ID(145931));
 			return func(a_sink);
 		}
 	};

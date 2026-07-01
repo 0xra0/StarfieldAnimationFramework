@@ -146,10 +146,10 @@ namespace Papyrus::SAFScript
     {
         // Preferuj ostatnio trafionego przez TESHitEvent (niezawodne przy strzałach)
         if (auto* hit = GetLastHitActor()) return hit;
-        // Fallback: crosshairRef (działa gdy nie strzelamy)
+        // Fallback: commandTarget (działa gdy nie strzelamy)
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return nullptr;
-        auto* ref = player->crosshairRef;
+        auto* ref = player->commandTarget;
         return ref ? ref->As<RE::Actor>() : nullptr;
     }
 
@@ -160,7 +160,7 @@ namespace Papyrus::SAFScript
         if (auto* hit = GetLastHitActor()) return hit;
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player) return nullptr;
-        if (auto* ref = player->crosshairRef) return ref->As<RE::Actor>();
+        if (auto* ref = player->commandTarget) return ref->As<RE::Actor>();
         return nullptr;
     }
 
@@ -173,7 +173,7 @@ namespace Papyrus::SAFScript
         RE::Actor* found = GetLastHitActor();
         if (!found) {
             auto* player = RE::PlayerCharacter::GetSingleton();
-            if (player) if (auto* ref = player->crosshairRef) found = ref->As<RE::Actor>();
+            if (player) if (auto* ref = player->commandTarget) found = ref->As<RE::Actor>();
         }
         if (!found) {
             SAF_LOG_WARN("[Papyrus] AddActorToSelectionBuffer: no hit actor");
@@ -262,7 +262,7 @@ namespace Papyrus::SAFScript
         return ok1 && ok2;
     }
 
-	// Zwraca referencję pod celownikiem (player->crosshairRef), albo none, jeśli brak.
+	// Zwraca referencję pod celownikiem (player->commandTarget), albo none, jeśli brak.
 	RE::TESObjectREFR* GetCrosshairRef(
 	    RE::BSScript::IVirtualMachine& /*a_vm*/,
 	    std::uint32_t /*a_stackID*/,
@@ -272,7 +272,7 @@ namespace Papyrus::SAFScript
 	    if (!player) {
 	        return nullptr;
 	    }
-	    return player->crosshairRef;
+	    return player->commandTarget;
 	}
 
     // =========================================================================
@@ -454,11 +454,16 @@ namespace Papyrus::SAFScript
         std::string path2 = resolve(a_animId2.c_str());
         if (a_speed <= 0.0f) a_speed = 1.0f;
 
-        // Schemat: blokada AI → wyrównanie pos+rot → animacja → odblokowanie po animacji.
+        // Schemat: blokada AI → wyrównanie pos+rot → zakotwiczenie pozycji → animacja → odblokowanie po animacji.
         // PrepareActorsForScene: zapisuje backup flag, blokuje AI obu NPC, ustawia
         // pos+kąt z actor1, wpisuje macierz yaw do root NiNode.
         // Po tej funkcji AI nie może nadpisać data.angle zanim AttachGenerator go odczyta.
         mgr->PrepareActorsForScene(a_actor1, a_actor2);
+
+        // Zakotwicz pozycje (jak PlaySceneSeparate) – bez tego positionLocked=false,
+        // yaw enforcement walczy z silnikiem gry powodując trzęsienie, a pozycja może dryfować.
+        { RE::NiPoint3 pos = a_actor1->GetPosition(); mgr->LockActorForAnimation(a_actor1, pos.x, pos.y, pos.z); }
+        { RE::NiPoint3 pos = a_actor2->GetPosition(); mgr->LockActorForAnimation(a_actor2, pos.x, pos.y, pos.z); }
 
         bool ok1 = mgr->LoadAndStartAnimation(a_actor1, path1, true, 0);
         bool ok2 = mgr->LoadAndStartAnimation(a_actor2, path2, true, 0);

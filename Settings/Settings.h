@@ -59,4 +59,9 @@ namespace Settings
 
 	/// GLTF node name -> SAF skeleton joint name (from Data/SAF/GLTFBoneAliases.ini). Enables GLBs with different bone names (e.g. Blender/Mixamo) to play without re-export.
 	const std::unordered_map<std::string, std::string>& GetGLTFBoneAliases();
+
+	/// Set the default skeleton to use as fallback for races without their own skeleton file.
+	void SetDefaultSkeleton(std::string a_defaultSkeleton);
+	/// Get the default skeleton name (default: "HumanRace").
+	const std::string& GetDefaultSkeleton();
 }
