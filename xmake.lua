@@ -1,9 +1,25 @@
-add_requires("ozz-animation", "fastgltf", "simdjson", "zstr")
+-- Linux cross-compile: project-local modules/detect/tools/find_rc.lua lets xmake
+-- locate an rc compiler (upstream find_rc is Windows-only). Needed for version.rc.
+add_moduledirs("modules")
+
+-- simdjson / fmt / spdlog / fastgltf are vendored under extern/ and compiled into
+-- static libs below, so they are NOT pulled from xrepo (would double-link).
+-- ozz-animation (incl. offline libs) and zstr(+zlib) come from xrepo.
+add_requires("ozz-animation 0.16.0", "zstr", "zlib")
 
 set_project("StarfieldAnimationFramework")
 set_version("1.0.0")
 add_rules("mode.debug", "mode.release")
 set_policy("check.auto_ignore_flags", false)
+
+-- clang-cl chokes on fmt 11's consteval FMT_STRING() (used by spdlog's error handler):
+-- "call to consteval function ... is not a constant expression". Fall back to constexpr.
+add_defines("FMT_USE_CONSTEVAL=0")
+
+-- commonlibsf's REX::Log has a std::wstring_view overload that calls spdlog; spdlog only
+-- exposes the wide-string log overloads when SPDLOG_WCHAR_TO_UTF8_SUPPORT is defined.
+-- Keep it global so the vendored spdlog and every consumer agree (ODR).
+add_defines("SPDLOG_WCHAR_TO_UTF8_SUPPORT")
 
 --------------------------------------------------
 -- SIMDJSON (CZYSTA, OSOBNA BIBLIOTEKA)
@@ -160,11 +176,8 @@ target("StarfieldAnimationFramework")
         { public = true }
     )
     
-    add_includedirs(
-        "extern/ozz-animation/include",
-        { public = true }
-    )
-    
+    -- ozz headers come from the xrepo ozz-animation package (kept in sync with its libs)
+
     add_includedirs(
         "extern/simdjson/include",
         { public = true }
@@ -214,4 +227,4 @@ target("StarfieldAnimationFramework")
     add_shflags("/ignore:4217", "/ignore:4286")
     -- NIE używamy /FORCE:UNRESOLVED: ukrywa brakujące symbole i kończy się crashem przy wywołaniu Papyrusa.
     add_rules("utils.symbols.export_all")
-    add_packages("ozz-animation", "fastgltf", "simdjson", "zlib", "zstr")
+    add_packages("ozz-animation", "zstr", "zlib")

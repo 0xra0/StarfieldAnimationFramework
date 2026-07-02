@@ -701,7 +701,7 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 				const auto categories = fastgltf::Category::Animations | fastgltf::Category::Nodes | fastgltf::Category::Meshes | fastgltf::Category::Buffers | fastgltf::Category::BufferViews | fastgltf::Category::Samplers | fastgltf::Category::Accessors | fastgltf::Category::Asset;
 				auto gltf = parser.loadGltfBinary(bufResult.get(), fileName.parent_path(), options, categories);
 				if (gltf.error() != fastgltf::Error::None) {
-					const char* section = fastgltf::getLastParseErrorSection();
+					const char* section = "";  // fastgltf::getLastParseErrorSection() is not in upstream fastgltf 0.8.0
 					SAF_LOG_WARN("LoadGLTF fallback GZIP: '{}' - loadGltfBinary failed: {} (parse section: {})", fileName.string(), fastgltf::getErrorMessage(gltf.error()).data(), section && *section ? section : "?");
 					return nullptr;
 				}
@@ -836,7 +836,7 @@ std::unique_ptr<Animation::RawOzzAnimation> GLTFImport::CreateRawAnimation(
 								SAF_LOG_INFO("LoadGLTF: NAF-style load succeeded for '{}'", fileName.string());
 								return assetData;
 							}
-							const char* section = fastgltf::getLastParseErrorSection();
+							const char* section = "";  // fastgltf::getLastParseErrorSection() is not in upstream fastgltf 0.8.0
 							SAF_LOG_INFO("LoadGLTF: NAF-style loadGltf failed for '{}': {} (parse section: {})", fileName.string(), fastgltf::getErrorMessage(gltf.error()).data(), section && *section ? section : "?");
 						}
 					}
