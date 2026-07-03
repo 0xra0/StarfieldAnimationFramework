@@ -2,9 +2,8 @@
 /build/
 /.xmake/
 
-# Reconstructed / vendored dependencies (not redistributed here).
-# See README "Building" for how to provide these locally.
-/extern/
+# Vestigial ozz-animation clone: ozz comes from the xrepo package, not this tree.
+/extern/ozz-animation/
 
 # Cross-build scratch
 *.bak-crossbuild

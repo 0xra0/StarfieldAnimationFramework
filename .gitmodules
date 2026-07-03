@@ -1,0 +1,16 @@
+[submodule "extern/commonlibsf"]
+	path = extern/commonlibsf
+	url = https://github.com/0xra0/commonlibsf.git
+	branch = starfield-crosshairref
+[submodule "extern/spdlog"]
+	path = extern/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "extern/fastgltf"]
+	path = extern/fastgltf
+	url = https://github.com/spnda/fastgltf.git
+[submodule "extern/fmt"]
+	path = extern/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "extern/simdjson"]
+	path = extern/simdjson
+	url = https://github.com/simdjson/simdjson.git

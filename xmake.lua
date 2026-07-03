@@ -16,6 +16,10 @@ set_policy("check.auto_ignore_flags", false)
 -- "call to consteval function ... is not a constant expression". Fall back to constexpr.
 add_defines("FMT_USE_CONSTEVAL=0")
 
+-- fmt is vendored as a pristine git submodule (extern/fmt); upstream fmt 11's base.h
+-- defines FMT_USE_CONSTEVAL unconditionally and ignores the -D above. The fmt_lib
+-- target's on_load re-applies a small #ifndef guard so the -D wins (see below).
+
 -- commonlibsf's REX::Log has a std::wstring_view overload that calls spdlog; spdlog only
 -- exposes the wide-string log overloads when SPDLOG_WCHAR_TO_UTF8_SUPPORT is defined.
 -- Keep it global so the vendored spdlog and every consumer agree (ODR).
@@ -43,6 +47,21 @@ target("fmt_lib")
     set_kind("static")
     set_languages("c++23")
     set_runtimes("MD")
+    -- Re-apply the FMT_USE_CONSTEVAL guard to the pristine fmt submodule so the global
+    -- -DFMT_USE_CONSTEVAL=0 is honored. Idempotent (keyed on a marker); on_load runs
+    -- during project load, before any target compiles anything that includes <fmt/*>.
+    on_load(function (target)
+        local base = path.join(os.projectdir(), "extern", "fmt", "include", "fmt", "base.h")
+        if os.isfile(base) then
+            local s = io.readfile(base)
+            if s and not s:find("FMT_USE_CONSTEVAL external override", 1, true) then
+                s = s:gsub("(// Detect consteval[^\n]*\n)", "%1#ifndef FMT_USE_CONSTEVAL\n", 1)
+                s = s:gsub("(#if FMT_USE_CONSTEVAL\n#  define FMT_CONSTEVAL consteval)",
+                           "#endif  // FMT_USE_CONSTEVAL external override\n%1", 1)
+                io.writefile(base, s)
+            end
+        end
+    end)
     -- Pomiń fmt.cc bo to plik dla C++ modules
     add_files("extern/fmt/src/*.cc|fmt.cc")
     add_includedirs(
