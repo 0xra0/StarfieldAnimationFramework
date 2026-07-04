@@ -78,6 +78,15 @@ namespace Util::Ozz
 		std::array<std::string_view, numArgs> strings = { a_targetNames... };
 		std::array<uint16_t, sizeof...(Args)> result;
 
+		// The runtime ozz skeleton can be null when a procedural node is set up
+		// before the skeleton has finished building (or if the build failed) —
+		// callers pass OzzSkeleton::data.get(), an empty unique_ptr yields null.
+		// Dereferencing it (joint_names() reads a member at +0x18) CTDs on a
+		// worker thread. Fail gracefully instead so the node just doesn't bind.
+		if (!a_skeleton) {
+			return std::nullopt;
+		}
+
 		for (size_t i = 0; i < numArgs; i++) {
 			result[i] = std::numeric_limits<uint16_t>::max();
 		}
