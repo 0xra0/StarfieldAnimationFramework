@@ -32,7 +32,13 @@ namespace MCF
     class ConsoleInterface
     {
     public:
-        virtual ~ConsoleInterface() = default;
+        // NOTE: must match ModernCommandFramework's own ConsoleInterface vtable
+        // EXACTLY. MCF constructs the object and its interface has NO virtual
+        // destructor, so the first vtable slot is GetSelectedReference. Declaring
+        // a virtual destructor here would shift every slot down by one, so a
+        // PrintLn() call would land on MCF's PreventDefaultPrint() and print
+        // nothing. Do not add a virtual destructor (this interface is never
+        // deleted through the base pointer — MCF owns the object).
         virtual RE::NiPointer<RE::TESObjectREFR> GetSelectedReference() = 0;
         virtual RE::TESForm* HexStrToForm(const simple_string_view& a_str) = 0;
         virtual void PrintLn(const simple_string_view& a_txt) = 0;
